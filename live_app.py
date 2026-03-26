@@ -18,7 +18,7 @@ DEFAULT_BAUD = 115200
 DEFAULT_TIMEOUT = 1
 
 # ✅ ADD YOUR ESP32 IP HERE
-ESP_URL = "http://192.168.157.94/data"   # 🔴 CHANGE THIS
+ESP_URL = "http://192.168.1.8/data"   # CHANGE THIS
 
 # Firebase Plant ID
 PLANT_ID = "plant_001"
