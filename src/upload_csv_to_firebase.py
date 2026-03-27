@@ -1,5 +1,6 @@
 """Upload soil_dataa.csv to Firebase Firestore as initial data"""
 import pandas as pd
+from pathlib import Path
 from datetime import datetime
 from firebase import db, _firebase_initialized
 
@@ -7,9 +8,13 @@ if not _firebase_initialized or db is None:
     print("❌ Firebase not initialized - check credentials")
     exit(1)
 
+# ── Resolve CSV path relative to this file so it works from any CWD ──────────
+BASE_DIR = Path(__file__).parent.parent  # project root
+CSV_PATH = BASE_DIR / "soil_dataa.csv"
+
 # Load CSV
-df = pd.read_csv('soil_dataa.csv')
-print(f"📂 Loaded {len(df)} rows from soil_dataa.csv")
+df = pd.read_csv(CSV_PATH)
+print(f"📂 Loaded {len(df)} rows from {CSV_PATH.name}")
 print(f"   Columns: {list(df.columns)}")
 print(f"   Health labels: {df['plant_health'].value_counts().to_dict()}")
 print()
@@ -17,7 +22,7 @@ print()
 PLANT_ID = "plant_001"
 collection_ref = db.collection('plants').document(PLANT_ID).collection('sensor_data')
 
-# Upload in batches of 500 (Firestore batch limit)
+# Upload in batches of 450 (Firestore batch limit is 500)
 BATCH_SIZE = 450
 total_uploaded = 0
 
@@ -48,4 +53,3 @@ for start in range(0, len(df), BATCH_SIZE):
 
 print(f"\n🎉 Done! {total_uploaded} records uploaded to Firestore")
 print(f"   📍 Path: plants/{PLANT_ID}/sensor_data")
-print(f"   🔍 Check at: https://console.firebase.google.com/project/iotml-3fb0d/firestore")

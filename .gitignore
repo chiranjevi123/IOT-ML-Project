@@ -4,3 +4,4 @@ __pycache__/
 *.pyo
 *.pkl
 firebase-creds.json
+.env

@@ -1,41 +1,33 @@
 import streamlit as st
-import serial
 import pickle
+from pathlib import Path
 from datetime import datetime
-import requests   
-import pandas as pd 
+import requests
+import pandas as pd
 from firebase import (get_recent_sensor_data, get_unread_alerts, mark_alerts_read,
                       get_plant_stats, save_sensor_data, send_plant_alert)
-# for auto-refresh without unsupported API
+from ai_advisor import get_plant_advice
+
 try:
     from streamlit_autorefresh import st_autorefresh
 except ImportError:
     st_autorefresh = None
 
+# ── Resolve paths relative to this file so it works from any CWD ──────────────
+BASE_DIR = Path(__file__).parent.parent  # project root
+
 # ----------- Configuration -----------
-DEFAULT_PORT = 'COM8'
+DEFAULT_PORT = '/dev/ttyUSB0'   # Linux default; change to COM8 on Windows
 DEFAULT_BAUD = 115200
 DEFAULT_TIMEOUT = 1
 
 # ✅ ADD YOUR ESP32 IP HERE
-ESP_URL = "http://192.168.1.8/data"   # CHANGE THIS
+ESP_URL = "http://192.168.1.8/data"   # CHANGE THIS to your ESP32 IP
 
 # Firebase Plant ID
 PLANT_ID = "plant_001"
 
-@st.cache_resource
-def get_serial_connection(port, baudrate, timeout=1):
-    try:
-        ser = serial.Serial(port=port, baudrate=baudrate, timeout=timeout)
-        return ser
-    except serial.SerialException as e:
-        st.error(f"⚠️ Serial port error: {e}")
-        return None
-    except Exception as e:
-        st.error(f"⚠️ Unexpected serial error: {e}")
-        return None
 
-# ----------- UPDATED PARSER (NO CHANGE) -----------
 def parse_sensor_line(line):
     raw = line.strip()
 
@@ -53,14 +45,13 @@ def parse_sensor_line(line):
 
     fields = raw.split(',')
 
-    if len(fields) != 4 or raw.count(',') != 3:
+    if len(fields) != 3 or raw.count(',') != 2:
         return None, f"Incomplete/invalid data: {fields}"
 
     try:
         temp = float(fields[0])
         humidity = float(fields[1])
-        soil_raw = float(fields[2])
-        soil_moisture = float(fields[3])        
+        soil_moisture = float(fields[2])
     except ValueError as e:
         return None, f"Parse error: {e}"
 
@@ -77,7 +68,6 @@ def parse_sensor_line(line):
         'soil_moisture': soil_moisture,
     }, None
 
-# ----------- REST CODE SAME -----------
 
 def get_recommendation(temp, humidity, soil_moisture, model_prediction):
     recs = []
@@ -98,45 +88,44 @@ def get_recommendation(temp, humidity, soil_moisture, model_prediction):
 
     recs.append(f"🤖 Model predicts: {model_prediction}")
 
-    if not recs:
-        recs.append("✅ All parameters are in nominal range.")
+    if len(recs) == 1:  # only the model prediction line
+        recs.insert(0, "✅ All parameters are in nominal range.")
     return recs
+
 
 st.set_page_config(page_title='Live IoT Plant Monitor', layout='wide', initial_sidebar_state='expanded')
 
 st.title('🌱 IoT Live Plant Monitoring (ESP32)')
-st.write('Use this dashboard with your ESP32 sensor stream. Adjust port and click `Read Sensor`.')
+st.write('Use this dashboard with your ESP32 sensor stream. Click `Read Sensor` to fetch live data.')
 
 with st.sidebar:
-    st.header('Serial Settings')
-    port = st.text_input('Serial port', DEFAULT_PORT)
-    baud = st.number_input('Baud rate', value=DEFAULT_BAUD, step=4800)
+    st.header('Settings')
     auto_refresh = st.checkbox('Auto-refresh (until stopped)', value=False)
     interval = st.slider('Refresh interval (seconds)', 1, 10, value=2)
 
 try:
-    model = pickle.load(open('model.pkl', 'rb'))
-    scaler = pickle.load(open('scaler.pkl', 'rb'))
+    model = pickle.load(open(BASE_DIR / 'model.pkl', 'rb'))
+    scaler = pickle.load(open(BASE_DIR / 'scaler.pkl', 'rb'))
 except FileNotFoundError:
     st.error('❌ model.pkl or scaler.pkl not found. Run train_model.py first, then restart this app.')
     st.stop()
-
-ser = get_serial_connection(port=port, baudrate=baud, timeout=DEFAULT_TIMEOUT)
 
 status_box = st.empty()
 metrics_box = st.container()
 log_box = st.expander('Raw log & debug output', expanded=False)
 
-# ✅ ----------- GRAPH STORAGE -----------
+# ✅ Graph storage
 if "df" not in st.session_state:
     st.session_state.df = pd.DataFrame(columns=["time", "temp", "humidity", "soil"])
+
 
 def process_sensor_reading():
     try:
         response = requests.get(ESP_URL, timeout=2)
         data = response.json()
 
-        line = f"{data['temp']},{data['humidity']},{data['soil']*30},{data['soil']}".strip()
+        # Build a clean 3-field line from WiFi JSON response
+        line = f"{data['temp']},{data['humidity']},{data['soil']}"
 
     except Exception as e:
         status_box.error(f"⚠️ Connection error: {e}")
@@ -154,7 +143,7 @@ def process_sensor_reading():
         status_box.info('ℹ️ Waiting for valid sensor data...')
         return None
 
-    # ✅ STORE DATA
+    # Store data for graphs
     new_row = {
         "time": datetime.now(),
         "temp": parsed['temp'],
@@ -163,13 +152,13 @@ def process_sensor_reading():
     }
 
     st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame([new_row])])
-    st.session_state.df = st.session_state.df.tail(200)   # ✅ UPDATED (long-term patterns)
+    st.session_state.df = st.session_state.df.tail(200)
 
     x = [[parsed['temp'], parsed['humidity'], parsed['soil_moisture']]]
     x_scaled = scaler.transform(x)
     prediction = model.predict(x_scaled)[0]
 
-    # 🔥 SAVE EVERY READING TO FIREBASE (for trends & future predictions)
+    # Save every reading to Firebase
     doc_id = save_sensor_data(PLANT_ID, parsed['temp'], parsed['humidity'],
                               parsed['soil_moisture'], prediction)
     if doc_id:
@@ -177,7 +166,7 @@ def process_sensor_reading():
     else:
         firebase_status = "⚠️ Firebase save failed"
 
-    # 🚨 SEND ALERT FOR UNHEALTHY CONDITIONS
+    # Send alert for unhealthy conditions
     if prediction == "Unhealthy":
         sensor_info = {
             'temperature': parsed['temp'],
@@ -185,6 +174,13 @@ def process_sensor_reading():
             'soil_moisture': parsed['soil_moisture']
         }
         send_plant_alert(PLANT_ID, "Unhealthy", sensor_info)
+
+    # Store latest reading in session_state for the AI advisor (rendered outside this fn)
+    st.session_state["live_temp"] = parsed['temp']
+    st.session_state["live_humidity"] = parsed['humidity']
+    st.session_state["live_soil"] = parsed['soil_moisture']
+    st.session_state["live_prediction"] = prediction
+    st.session_state["live_ai_advice"] = st.session_state.get("live_ai_advice")  # preserve old advice
 
     with metrics_box:
         c1, c2, c3 = st.columns(3)
@@ -202,71 +198,96 @@ def process_sensor_reading():
 
         st.caption(f'Last read: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} | {firebase_status}')
 
-        # 🔥 ----------- FIREBASE DATA & ALERTS -----------
-        st.markdown("---")
-        st.subheader("📊 Firebase Database Status")
-
-        # Show recent Firebase data
-        firebase_data = get_recent_sensor_data("plant_001", limit=10)
-        if firebase_data:
-            firebase_df = pd.DataFrame(firebase_data)
-            firebase_df['timestamp'] = pd.to_datetime(firebase_df['timestamp']).dt.strftime('%H:%M:%S')
-
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("Firebase Records", len(firebase_data))
-            with col2:
-                if len(firebase_data) > 0:
-                    latest = firebase_data[0]
-                    st.metric("Latest Prediction", latest.get('plant_health', 'N/A'))
-
-            # Show alerts
-            alerts = get_unread_alerts("plant_001")
-            if alerts:
-                st.error(f"🚨 {len(alerts)} unread alert(s)")
-                for alert in alerts[:3]:  # Show last 3 alerts
-                    st.warning(f"{alert.get('type', 'Alert')}: {alert.get('message', '')}")
-                    if st.button(f"Mark Read - {alert.get('timestamp', '')[:19]}", key=f"alert_{alert.get('timestamp', '')}"):
-                        mark_alerts_read("plant_001", [alert.get('id', '')])
-                        st.rerun()
-            else:
-                st.success("✅ No active alerts")
-        else:
-            st.warning("⚠️ No Firebase data available")
-
-        # Show plant statistics
-        stats = get_plant_stats("plant_001")
-        if stats:
-            st.markdown("### 📈 24h Statistics")
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Total Readings", stats.get('total_readings', 0))
-            col2.metric("Avg Temp (°C)", f"{stats.get('avg_temperature', 0):.1f}")
-            col3.metric("Avg Humidity (%)", f"{stats.get('avg_humidity', 0):.1f}")
-            col4.metric("Avg Soil (%)", f"{stats.get('avg_soil_moisture', 0):.1f}")
-
-        # ✅ ----------- GRAPHS WITH TIME FORMAT -----------
-
-        st.markdown("### 📈 Real-Time Sensor Graphs")
-
-        df = st.session_state.df.copy()
-        df["time"] = pd.to_datetime(df["time"]).dt.strftime("%H:%M")  # ✅ HH:mm format
-        df = df.set_index("time")
-
-        st.subheader("🌡 Temperature vs Time")
-        st.line_chart(df["temp"])
-
-        st.subheader("💧 Humidity vs Time")
-        st.line_chart(df["humidity"])
-
-        st.subheader("🌱 Soil Moisture vs Time")
-        st.line_chart(df["soil"])
-
     status_box.success('✅ Sensor data processed successfully')
+
 
 button_read = st.button('📡 Read Sensor (manual)')
 
 if button_read or auto_refresh:
     process_sensor_reading()
+
+# ── AI Plant Advisor ──────────────────────────────────────────────────────────
+# Rendered OUTSIDE process_sensor_reading so it persists when AI button is clicked
+if "live_prediction" in st.session_state:
+    st.markdown("---")
+    st.subheader("🤖 AI Plant Advisor (Groq)")
+
+    if st.button("🔍 Ask AI for plant advice"):
+        stats = get_plant_stats(PLANT_ID)
+        with st.spinner("🌿 Consulting AI plant advisor..."):
+            advice = get_plant_advice(
+                st.session_state["live_temp"],
+                st.session_state["live_humidity"],
+                st.session_state["live_soil"],
+                st.session_state["live_prediction"],
+                stats
+            )
+        st.session_state["live_ai_advice"] = advice
+
+    if st.session_state.get("live_ai_advice"):
+        st.info(st.session_state["live_ai_advice"])
+    else:
+        st.caption("Click the button above to get an AI-powered analysis of your plant's condition.")
+
+# ── Firebase status, Alerts, Stats, Graphs ────────────────────────────────────
+# Rendered OUTSIDE process_sensor_reading so alert Mark-Read button works correctly
+if "live_prediction" in st.session_state:
+    st.markdown("---")
+    st.subheader("📊 Firebase Database Status")
+
+    firebase_data = get_recent_sensor_data(PLANT_ID, limit=10)
+    if firebase_data:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Firebase Records", len(firebase_data))
+        with col2:
+            latest = firebase_data[0]
+            st.metric("Latest Prediction", latest.get('plant_health', 'N/A'))
+
+        # Alerts — each alert dict includes 'id' from get_unread_alerts()
+        alerts = get_unread_alerts(PLANT_ID)
+        if alerts:
+            st.error(f"🚨 {len(alerts)} unread alert(s)")
+            for alert in alerts[:5]:
+                alert_id  = alert.get('id', '')
+                ts_raw    = alert.get('timestamp')
+                # Firestore returns DatetimeWithNanoseconds — convert safely
+                if hasattr(ts_raw, 'strftime'):
+                    ts_label = ts_raw.strftime('%Y-%m-%d %H:%M:%S')
+                else:
+                    ts_label = str(ts_raw)[:19]
+
+                st.warning(f"**{alert.get('type', 'Alert')}**: {alert.get('message', '')}")
+                if st.button(f"✅ Mark Read — {ts_label}", key=f"markread_{alert_id}"):
+                    mark_alerts_read(PLANT_ID, [alert_id])
+                    st.rerun()
+        else:
+            st.success("✅ No active alerts")
+    else:
+        st.warning("⚠️ No Firebase data available yet — read a sensor first")
+
+    # 24h statistics
+    stats = get_plant_stats(PLANT_ID)
+    if stats and stats.get('total_readings', 0) > 0:
+        st.markdown("### 📈 24h Statistics")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Readings",  stats.get('total_readings', 0))
+        col2.metric("Avg Temp (°C)",   f"{stats.get('avg_temperature', 0):.1f}")
+        col3.metric("Avg Humidity (%)", f"{stats.get('avg_humidity', 0):.1f}")
+        col4.metric("Avg Soil (%)",    f"{stats.get('avg_soil_moisture', 0):.1f}")
+
+    # Real-time graphs (session data only — resets on page refresh)
+    if not st.session_state.df.empty:
+        st.markdown("### 📈 Real-Time Sensor Graphs")
+        df = st.session_state.df.copy()
+        df["time"] = pd.to_datetime(df["time"]).dt.strftime("%H:%M")
+        df = df.set_index("time")
+        st.subheader("🌡 Temperature vs Time")
+        st.line_chart(df["temp"])
+        st.subheader("💧 Humidity vs Time")
+        st.line_chart(df["humidity"])
+        st.subheader("🌱 Soil Moisture vs Time")
+        st.line_chart(df["soil"])
 
 if auto_refresh:
     if st_autorefresh is None:
@@ -276,5 +297,5 @@ if auto_refresh:
 
 st.write('---')
 st.markdown('**Notes:**')
-st.write('- For stable operation, avoid continuous while loops in Streamlit. Use manual refresh or auto-refresh with controlled interval.')
-st.write('- Ensure ESP32 is writing data in `temp,humidity,soil_moisture` format.')
+st.write('- Ensure ESP32 is on the same WiFi network and the IP matches ESP_URL at the top of this file.')
+st.write('- ESP32 should return JSON with keys: temp, humidity, soil')
