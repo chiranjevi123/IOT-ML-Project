@@ -1,8 +1,16 @@
 import firebase_admin
-from firebase_admin import credentials, firestore, messaging
+from firebase_admin import credentials, firestore
 import pandas as pd
 from datetime import datetime, timedelta
 import os
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from dotenv import load_dotenv
+from pathlib import Path
+
+# Load .env from project root
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 
 # Initialize Firebase Admin SDK
@@ -130,32 +138,71 @@ def get_sensor_data_for_training(plant_id, days=30):
 
 
 def send_plant_alert(plant_id, condition, sensor_data):
-    """Send notification for plant health alerts"""
-    if db is None:
-        return False
-    try:
-        title = f"🌱 Plant Alert - {condition}"
-        body = f"Temperature: {sensor_data['temperature']}°C, " \
-               f"Humidity: {sensor_data['humidity']}%, " \
-               f"Soil: {sensor_data['soil_moisture']}%"
+    """Send email notification for plant health alerts via Gmail SMTP"""
+    sender   = os.getenv("EMAIL_SENDER")
+    password = os.getenv("EMAIL_PASSWORD")   # Gmail App Password
+    receiver = os.getenv("EMAIL_RECEIVER")
 
-        message = messaging.Message(
-            notification=messaging.Notification(
-                title=title,
-                body=body
-            ),
-            topic=f"plant_{plant_id}_alerts"  # Subscribe devices to this topic
-        )
-
-        response = messaging.send(message)
-        print(f"Alert sent successfully: {response}")
-
-        # Also save alert to database
+    if not all([sender, password, receiver]):
+        print("⚠️ Email not configured — set EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECEIVER in .env")
+        # Still save alert to Firestore even if email is not configured
+        body = (f"Temperature: {sensor_data['temperature']}°C, "
+                f"Humidity: {sensor_data['humidity']}%, "
+                f"Soil: {sensor_data['soil_moisture']}%")
         save_alert_to_db(plant_id, condition, body)
+        return False
 
+    temp  = sensor_data['temperature']
+    hum   = sensor_data['humidity']
+    soil  = sensor_data['soil_moisture']
+
+    subject = f"🌱 Plant Alert — {condition} Condition Detected"
+
+    html_body = f"""\
+    <html><body style="font-family: Arial, sans-serif; padding: 20px;">
+      <h2 style="color:#e74c3c;">🌿 Plant Health Alert</h2>
+      <p>Your plant (<b>{plant_id}</b>) has been detected as <b style="color:#e74c3c;">{condition}</b>.</p>
+      <table style="border-collapse:collapse; width:300px;">
+        <tr><th style="background:#f2f2f2;padding:8px;text-align:left;">Sensor</th>
+            <th style="background:#f2f2f2;padding:8px;text-align:left;">Value</th></tr>
+        <tr><td style="padding:8px;">🌡️ Temperature</td><td style="padding:8px;">{temp}°C</td></tr>
+        <tr><td style="padding:8px;">💧 Humidity</td>   <td style="padding:8px;">{hum}%</td></tr>
+        <tr><td style="padding:8px;">🌱 Soil Moisture</td><td style="padding:8px;">{soil}%</td></tr>
+      </table>
+      <p style="margin-top:16px;">Please check on your plant and take action as needed.</p>
+      <hr/><small>Sent by IoT Plant Monitor</small>
+    </body></html>
+    """
+
+    plain_body = (f"Plant Alert — {condition}\n"
+                  f"Temperature: {temp}°C | Humidity: {hum}% | Soil: {soil}%\n"
+                  f"Please check on your plant.")
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"]    = sender
+    msg["To"]      = receiver
+    msg.attach(MIMEText(plain_body, "plain"))
+    msg.attach(MIMEText(html_body,  "html"))
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(sender, password)
+            smtp.sendmail(sender, receiver, msg.as_string())
+        print(f"📧 Alert email sent to {receiver}")
+
+        # Save to Firestore for dashboard display
+        save_alert_to_db(plant_id, condition, plain_body)
         return True
+
+    except smtplib.SMTPAuthenticationError:
+        print("❌ Gmail authentication failed — make sure you are using an App Password, not your regular password.")
+        print("   Guide: https://support.google.com/accounts/answer/185833")
+        save_alert_to_db(plant_id, condition, plain_body)
+        return False
     except Exception as e:
-        print(f"Error sending alert: {e}")
+        print(f"❌ Failed to send alert email: {e}")
+        save_alert_to_db(plant_id, condition, plain_body)
         return False
 
 

@@ -5,7 +5,7 @@ from datetime import datetime
 import requests
 import pandas as pd
 from firebase import (get_recent_sensor_data, get_unread_alerts, mark_alerts_read,
-                      get_plant_stats, save_sensor_data, send_plant_alert)
+                      get_plant_stats, save_sensor_data, send_plant_alert, save_alert_to_db)
 from ai_advisor import get_plant_advice
 
 import time
@@ -262,7 +262,10 @@ def process_sensor_reading():
             send_email_alert(priority, alert_msg, parsed['temp'], parsed['humidity'], parsed['soil_moisture'], prediction)
             st.session_state.last_alert_time = current_time
             st.session_state.last_alert_priority = priority
-            
+
+            # ✅ Persist alert to Firestore so it survives page refresh
+            save_alert_to_db(PLANT_ID, priority, alert_msg)
+
             # Save to UI Alert History (Limit 10)
             alert_entry = {
                 "time": datetime.now().strftime("%H:%M:%S"),
