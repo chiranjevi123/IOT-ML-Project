@@ -8,6 +8,11 @@ from firebase import (get_recent_sensor_data, get_unread_alerts, mark_alerts_rea
                       get_plant_stats, save_sensor_data, send_plant_alert)
 from ai_advisor import get_plant_advice
 
+import time
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
 try:
     from streamlit_autorefresh import st_autorefresh
 except ImportError:
@@ -17,15 +22,72 @@ except ImportError:
 BASE_DIR = Path(__file__).parent.parent  # project root
 
 # ----------- Configuration -----------
-DEFAULT_PORT = '/dev/ttyUSB0'   # Linux default; change to COM8 on Windows
+DEFAULT_PORT = 'COM8'   # Linux default; change to COM8 on Windows
 DEFAULT_BAUD = 115200
 DEFAULT_TIMEOUT = 1
 
 # ✅ ADD YOUR ESP32 IP HERE
-ESP_URL = "http://192.168.1.8/data"   # CHANGE THIS to your ESP32 IP
+ESP_URL = "http://192.168.1.19/data"   # CHANGE THIS to your ESP32 IP
 
-# Firebase Plant ID
+# Firebase Plant ID``
 PLANT_ID = "plant_001"
+
+# ----------- Email Alert Configuration -----------
+SENDER_EMAIL = "devap6622@gmail.com"       #  Change to your Gmail
+APP_PASSWORD = "doyr ypey ubis ebtc"          # Change to your 16-char App Password
+RECEIVER_EMAIL = "chiranjevidabbeti@gmail.com" # Change to receiver Gmail
+ALERT_COOLDOWN = 60                         #  Seconds to wait before sending another email
+
+
+def send_email_alert(priority, msg, temp, humidity, soil, prediction):
+    """Sends an email alert using Gmail SMTP."""
+    if APP_PASSWORD == "doyr ypey ubis ebtc" and SENDER_EMAIL != "devap6622@gmail.com":
+         # Just a safety check; we will let it attempt to send anyway!
+         pass
+
+    try:
+        subject = f"🚨 Plant Monitor Alert: {priority}"
+        body = f"🌱 Plant Monitoring Alert system triggered!\n\n" \
+               f"Priority: {priority}\n" \
+               f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n" \
+               f"📊 Sensor Readings:\n" \
+               f"- Temperature: {temp} °C\n" \
+               f"- Humidity: {humidity} %\n" \
+               f"- Soil Moisture: {soil} %\n" \
+               f"- Model Prediction: {prediction}\n\n" \
+               f"⚠️ Message: {msg}"
+        
+        msg_obj = MIMEMultipart()
+        msg_obj['From'] = SENDER_EMAIL
+        msg_obj['To'] = RECEIVER_EMAIL
+        msg_obj['Subject'] = subject
+        msg_obj.attach(MIMEText(body, 'plain'))
+        
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(SENDER_EMAIL, APP_PASSWORD)
+        server.send_message(msg_obj)
+        server.quit()
+        print(f"Email alert sent successfully! Priority: {priority}")
+    except Exception as e:
+        print(f"Failed to send email alert: {e}")
+
+def generate_alert(temp, humidity, soil_moisture, prediction):
+    """
+    Evaluates sensor data and returns (Priority, Message).
+    Logic derived from previous project recommendations logic.
+    """
+    # CRITICAL checks
+    if soil_moisture < 20 or temp > 38 or temp < 12 or prediction == "Unhealthy":
+        msg = f"Critical levels detected: Soil {soil_moisture}%, Temp {temp}°C. Action required!"
+        return "CRITICAL", msg
+    # WARNING checks
+    elif soil_moisture < 40 or temp > 30 or humidity < 35 or humidity > 80:
+        msg = f"Conditions sub-optimal: Soil {soil_moisture}%, Temp {temp}°C, Hum {humidity}%."
+        return "WARNING", msg
+    # NORMAL
+    else:
+        return "NORMAL", "Parameters are in safe range."
 
 
 def parse_sensor_line(line):
@@ -118,6 +180,13 @@ log_box = st.expander('Raw log & debug output', expanded=False)
 if "df" not in st.session_state:
     st.session_state.df = pd.DataFrame(columns=["time", "temp", "humidity", "soil"])
 
+# ✅ Alert System storage
+if "alert_history" not in st.session_state:
+    st.session_state.alert_history = []
+if "last_alert_time" not in st.session_state:
+    st.session_state.last_alert_time = 0
+if "last_alert_priority" not in st.session_state:
+    st.session_state.last_alert_priority = "NORMAL"
 
 def process_sensor_reading():
     try:
@@ -166,7 +235,7 @@ def process_sensor_reading():
     else:
         firebase_status = "⚠️ Firebase save failed"
 
-    # Send alert for unhealthy conditions
+    # Send alert for unhealthy conditions (Firebase)
     if prediction == "Unhealthy":
         sensor_info = {
             'temperature': parsed['temp'],
@@ -174,6 +243,34 @@ def process_sensor_reading():
             'soil_moisture': parsed['soil_moisture']
         }
         send_plant_alert(PLANT_ID, "Unhealthy", sensor_info)
+
+    # ---------------- 🚨 Priority Alert Logic Integration ----------------
+    priority, alert_msg = generate_alert(parsed['temp'], parsed['humidity'], parsed['soil_moisture'], prediction)
+    
+    current_time = time.time()
+    send_email = False
+    
+    if priority != "NORMAL":
+        time_since_last = current_time - st.session_state.last_alert_time
+        
+        # Smart Alert Logic: Avoid spam.
+        # Send if priority is CRITICAL or if Priority Changed. Also respect Cooldown.
+        if (priority == "CRITICAL" or priority != st.session_state.last_alert_priority) and time_since_last > ALERT_COOLDOWN:
+            send_email = True
+            
+        if send_email:
+            send_email_alert(priority, alert_msg, parsed['temp'], parsed['humidity'], parsed['soil_moisture'], prediction)
+            st.session_state.last_alert_time = current_time
+            st.session_state.last_alert_priority = priority
+            
+            # Save to UI Alert History (Limit 10)
+            alert_entry = {
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "priority": priority,
+                "msg": alert_msg
+            }
+            st.session_state.alert_history.insert(0, alert_entry)
+            st.session_state.alert_history = st.session_state.alert_history[:10]
 
     # Store latest reading in session_state for the AI advisor (rendered outside this fn)
     st.session_state["live_temp"] = parsed['temp']
@@ -228,6 +325,33 @@ if "live_prediction" in st.session_state:
         st.info(st.session_state["live_ai_advice"])
     else:
         st.caption("Click the button above to get an AI-powered analysis of your plant's condition.")
+
+# ── Alert Dashboard ───────────────────────────────────────────────────────────
+if "live_prediction" in st.session_state:
+    st.markdown("---")
+    st.subheader("🚨 Live Streamlit Alert Panel")
+    
+    if not st.session_state.alert_history:
+        st.success("🟢 No abnormal conditions detected recently.")
+    else:
+        latest_alert = st.session_state.alert_history[0]
+        color = "#ff4b4b" if latest_alert['priority'] == "CRITICAL" else "#ffa000"
+        
+        # Highlight latest alert
+        st.markdown(
+            f"""
+            <div style="border: 2px solid {color}; padding: 10px; border-radius: 5px; background-color: {color}11;">
+                <h4 style="margin:0; color: {color};">[{latest_alert['priority']}] {latest_alert['msg']}</h4>
+                <small>Last triggered: {latest_alert['time']}</small>
+            </div>
+            """, 
+            unsafe_allow_html=True
+        )
+        
+        with st.expander("Show Alert History (Last 10)"):
+            for alert in st.session_state.alert_history:
+                icon = "🔴" if alert['priority'] == "CRITICAL" else "🟡"
+                st.markdown(f"`{alert['time']}` | {icon} **{alert['priority']}** | {alert['msg']}")
 
 # ── Firebase status, Alerts, Stats, Graphs ────────────────────────────────────
 # Rendered OUTSIDE process_sensor_reading so alert Mark-Read button works correctly
